@@ -18,6 +18,9 @@
 
 #include "mm_internal.h"
 
+/* StrongBox: single-thread version */
+#define STRONGBOX_CPU1 3
+
 /*
  *	TLB flushing, formerly SMP-only
  *		c/o Linus Torvalds.
@@ -669,6 +672,34 @@ static bool tlb_is_not_lazy(int cpu, void *data)
 void native_flush_tlb_others(const struct cpumask *cpumask,
 			     const struct flush_tlb_info *info)
 {
+	
+	int this_cpu = smp_processor_id();
+	int cpu;
+	cpumask_var_t non_isolated_cpumask; 
+	
+	// flush TLB locally (strongbox dedicated cpu)
+	if (this_cpu == STRONGBOX_CPU1){
+		flush_tlb_func_local(info, TLB_LOCAL_MM_SHOOTDOWN);
+		return;
+	}
+	
+	// whether `non_isolated_cpumask` is allocated 
+	if (!zalloc_cpumask_var(&non_isolated_cpumask, GFP_KERNEL))
+		return;
+
+	// add cpu to `non_isolated_cpumask` (except STRONGBOX_CPU1)
+	for_each_cpu(cpu, cpumask){
+		if (cpu != STRONGBOX_CPU1)
+			cpumask_set_cpu(cpu, non_isolated_cpumask);
+	}
+
+	// only one cpu
+	// FIXME: (this case should be removed.)
+	if (cpumask_empty(non_isolated_cpumask)){
+		free_cpumask_var(non_isolated_cpumask);
+		return;
+	}
+
 	count_vm_tlb_event(NR_TLB_REMOTE_FLUSH);
 	if (info->end == TLB_FLUSH_ALL)
 		trace_tlb_flush(TLB_REMOTE_SEND_IPI, TLB_FLUSH_ALL);
@@ -676,6 +707,7 @@ void native_flush_tlb_others(const struct cpumask *cpumask,
 		trace_tlb_flush(TLB_REMOTE_SEND_IPI,
 				(info->end - info->start) >> PAGE_SHIFT);
 
+	/* FIXME: what is UV system ? */
 	if (is_uv_system()) {
 		/*
 		 * This whole special case is confused.  UV has a "Broadcast
@@ -709,12 +741,16 @@ void native_flush_tlb_others(const struct cpumask *cpumask,
 	 * up on the new contents of what used to be page tables, while
 	 * doing a speculative memory access.
 	 */
+	// replace `cpumask` with `non_isolated_cpumask`
 	if (info->freed_tables)
-		smp_call_function_many(cpumask, flush_tlb_func_remote,
+		smp_call_function_many(non_isolated_cpumask, flush_tlb_func_remote,
 			       (void *)info, 1);
 	else
 		on_each_cpu_cond_mask(tlb_is_not_lazy, flush_tlb_func_remote,
-				(void *)info, 1, GFP_ATOMIC, cpumask);
+				(void *)info, 1, GFP_ATOMIC, non_isolated_cpumask);
+
+	/* strongbox */
+	free_cpumask_var(non_isolated_cpumask);
 }
 
 /*
